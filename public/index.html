@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Qwen3VL Local Vision UI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Local vision model</p>
+        <h1>Ask your own Qwen model to explain images and short videos.</h1>
+        <p class="lede">
+          Upload a picture or short video, add a question if you want, and the model will describe what it sees on this machine.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="analyze-form" class="stack">
+          <label id="upload-zone" class="upload-zone" for="image-input">
+            <input id="image-input" name="media" type="file" accept="image/*,video/*" required />
+            <span class="upload-title">Drop an image or video here, or click to browse</span>
+            <span class="upload-subtitle">Images or short videos up to 120 MB</span>
+            <span class="upload-note">Videos are summarized from sampled frames across the clip.</span>
+            <span id="file-name" class="file-name hidden"></span>
+          </label>
+
+          <div id="preview-wrap" class="preview-wrap hidden">
+            <div class="preview-stage">
+              <img id="preview-image" alt="Selected preview" class="hidden" />
+              <video id="preview-video" class="hidden" controls playsinline></video>
+              <canvas id="overlay-canvas" class="overlay-canvas hidden"></canvas>
+            </div>
+            <div id="subject-box-status" class="subject-box-status hidden"></div>
+          </div>
+
+          <label class="field">
+            <span>Your prompt</span>
+            <textarea
+              id="prompt"
+              name="prompt"
+              rows="4"
+              placeholder="Example: Summarize this video and mention the key events, or explain this image and extract readable text."
+            ></textarea>
+          </label>
+
+          <div class="action-row">
+            <button id="submit-button" type="submit">Explain Media</button>
+            <button id="focus-cut-button" class="secondary-button" type="button">
+              Focus and Cut
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel output-panel">
+        <div class="output-head">
+          <h2>Result</h2>
+          <span id="status-pill" class="pill">Checking model...</span>
+        </div>
+        <a id="generated-link" class="generated-link hidden" href="#" rel="noopener">
+          Download Output Video
+        </a>
+        <pre id="result" class="result">The answer will appear here.</pre>
+      </section>
+    </main>
+
+    <script
+      src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js"
+      crossorigin="anonymous"
+    ></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
