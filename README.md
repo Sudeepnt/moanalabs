@@ -19,6 +19,14 @@ The app now starts `llama-server` with a larger default context window and will 
 
 This app handles video by sampling a small number of frames with `ffmpeg` and sending those frames to the model in time order. It is not native end-to-end video inference, but it works well for short clips and scene summaries.
 
+## Focus cut style rules
+
+Focus-cut layout decisions are bound to the project file [config/focus-style-rules.md](/Users/sudeepnt/Desktop/DMain/Codex Projects/qwen vl/config/focus-style-rules.md).
+
+The renderer treats `BIG` as the default tight vertical crop and only switches to `MID` when those project rules say full-frame context is necessary.
+
+Focus-plan sampling defaults are bound to [config/focus-style-settings.json](/Users/sudeepnt/Desktop/DMain/Codex Projects/qwen vl/config/focus-style-settings.json). The renderer now adds extra AI layout probes around scene changes, plus OCR-based text forcing in the frame renderer so text-heavy cutaways can flip to `MID` immediately.
+
 ## Subject boxes
 
 After each explanation, the backend asks Qwen for a short main-subject hint, and the frontend uses MediaPipe to choose the closest matching detection box on the preview image or current video frame.
@@ -61,4 +69,5 @@ FFMPEG_BIN="/absolute/path/to/ffmpeg"
 FFPROBE_BIN="/absolute/path/to/ffprobe"
 GPU_LAYERS=999
 MAX_VIDEO_FRAMES=6
+MAX_UPLOAD_MB=1024
 ```

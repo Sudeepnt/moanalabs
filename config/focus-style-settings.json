@@ -1,0 +1,18 @@
+{
+  "default": {
+    "sample_interval_sec": 6.0,
+    "batch_size": 4,
+    "scene_change_threshold": 24.0,
+    "scene_change_min_gap_sec": 0.9,
+    "text_check_interval_sec": 0.5,
+    "text_hold_sec": 0.75
+  },
+  "speaker": {
+    "sample_interval_sec": 4.0,
+    "batch_size": 4,
+    "scene_change_threshold": 16.0,
+    "scene_change_min_gap_sec": 0.75,
+    "text_check_interval_sec": 0.5,
+    "text_hold_sec": 0.8
+  }
+}

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Qwen3VL Local Vision UI</title>
+    <title>Dual Local Vision UI</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -15,10 +15,10 @@
   <body>
     <main class="shell">
       <section class="hero">
-        <p class="eyebrow">Local vision model</p>
-        <h1>Ask your own Qwen model to explain images and short videos.</h1>
+        <p class="eyebrow">Local vision models</p>
+        <h1>Choose Qwen or LFM, then run that model on your image or video.</h1>
         <p class="lede">
-          Upload a picture or short video, add a question if you want, and the model will describe what it sees on this machine.
+          Upload a picture or short video, pick the model in the form, and this machine will load only that model in RAM for inference.
         </p>
       </section>
 
@@ -27,9 +27,14 @@
           <label id="upload-zone" class="upload-zone" for="image-input">
             <input id="image-input" name="media" type="file" accept="image/*,video/*" required />
             <span class="upload-title">Drop an image or video here, or click to browse</span>
-            <span class="upload-subtitle">Images or short videos up to 120 MB</span>
+            <span id="upload-subtitle" class="upload-subtitle">Images or short videos up to configured size limit</span>
             <span class="upload-note">Videos are summarized from sampled frames across the clip.</span>
             <span id="file-name" class="file-name hidden"></span>
+          </label>
+
+          <label class="field">
+            <span>Model</span>
+            <select id="model-select"></select>
           </label>
 
           <div id="preview-wrap" class="preview-wrap hidden">
@@ -68,6 +73,19 @@
         <a id="generated-link" class="generated-link hidden" href="#" rel="noopener">
           Download Output Video
         </a>
+        <div id="focus-progress" class="focus-progress hidden" aria-live="polite">
+          <div class="focus-progress-head">
+            <span id="focus-progress-stage">Preparing...</span>
+            <span id="focus-progress-percent">0%</span>
+          </div>
+          <div class="focus-progress-bar">
+            <div id="focus-progress-fill" class="focus-progress-fill"></div>
+          </div>
+          <div class="focus-progress-meta">
+            <span id="focus-progress-eta">Estimating time left...</span>
+            <span id="focus-progress-detail"></span>
+          </div>
+        </div>
         <pre id="result" class="result">The answer will appear here.</pre>
       </section>
     </main>

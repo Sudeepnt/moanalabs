@@ -2,7 +2,9 @@ const form = document.getElementById("analyze-form");
 const input = document.getElementById("image-input");
 const uploadZone = document.getElementById("upload-zone");
 const fileName = document.getElementById("file-name");
+const uploadSubtitle = document.getElementById("upload-subtitle");
 const promptInput = document.getElementById("prompt");
+const modelSelect = document.getElementById("model-select");
 const previewWrap = document.getElementById("preview-wrap");
 const previewImage = document.getElementById("preview-image");
 const previewVideo = document.getElementById("preview-video");
@@ -14,9 +16,16 @@ const explainButton = document.getElementById("submit-button");
 const focusCutButton = document.getElementById("focus-cut-button");
 const statusPill = document.getElementById("status-pill");
 const generatedLink = document.getElementById("generated-link");
+const focusProgress = document.getElementById("focus-progress");
+const focusProgressStage = document.getElementById("focus-progress-stage");
+const focusProgressPercent = document.getElementById("focus-progress-percent");
+const focusProgressFill = document.getElementById("focus-progress-fill");
+const focusProgressEta = document.getElementById("focus-progress-eta");
+const focusProgressDetail = document.getElementById("focus-progress-detail");
 
 const EXPLAIN_BUTTON_TEXT = "Explain Media";
 const FOCUS_CUT_BUTTON_TEXT = "Focus and Cut";
+const FOCUS_POLL_INTERVAL_MS = 900;
 
 let selectedFile = null;
 let previewUrl = null;
@@ -27,6 +36,8 @@ let videoLoopHandle = null;
 let currentSubjectHint = "";
 let lastVideoTime = -1;
 let mediaPipeUnavailable = false;
+let activeModelId = "";
+let modelSwitchInFlight = false;
 
 input.addEventListener("change", () => {
   const file = input.files?.[0];
@@ -42,6 +53,10 @@ input.addEventListener("change", () => {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   await runExplainRequest();
+});
+
+modelSelect.addEventListener("change", async () => {
+  await activateSelectedModel();
 });
 
 focusCutButton.addEventListener("click", async () => {
@@ -104,16 +119,32 @@ async function refreshStatus() {
   try {
     const response = await fetch("/api/status");
     const data = await response.json();
+    syncModelSelector(data);
+    if (uploadSubtitle) {
+      const maxUploadMb = Number(data?.maxUploadMb);
+      if (Number.isFinite(maxUploadMb) && maxUploadMb > 0) {
+        uploadSubtitle.textContent = `Images or short videos up to ${maxUploadMb} MB`;
+      }
+    }
+    const missingModel = data.models?.find((model) => !model.modelExists);
+    const missingMmproj = data.models?.find((model) => !model.mmprojExists);
 
     if (data.ok) {
-      statusPill.textContent = "Model ready";
+      statusPill.textContent = data.activeModelName
+        ? `Models ready (${data.activeModelName} active)`
+        : "Models ready";
       statusPill.classList.add("ready");
-      clearInterval(statusTimer);
       return;
     }
 
-    if (!data.mmprojExists) {
-      statusPill.textContent = "Missing mmproj";
+    if (missingModel) {
+      statusPill.textContent = `Missing ${missingModel.name} model`;
+      statusPill.classList.remove("ready");
+      return;
+    }
+
+    if (missingMmproj) {
+      statusPill.textContent = `Missing ${missingMmproj.name} mmproj`;
       statusPill.classList.remove("ready");
       return;
     }
@@ -141,12 +172,16 @@ async function runExplainRequest() {
   const formData = new FormData();
   formData.append("media", selectedFile);
   formData.append("prompt", promptInput.value);
+  if (activeModelId) {
+    formData.append("modelId", activeModelId);
+  }
 
   setActionState("explain", true);
   hideGeneratedLink();
+  hideFocusProgress();
   result.textContent = isVideoFile(selectedFile)
-    ? "Uploading video, sampling frames, and asking the model..."
-    : "Uploading image and asking the model...";
+    ? `Uploading video, sampling frames, and running ${getActiveModelName()}...`
+    : `Uploading image and running ${getActiveModelName()}...`;
 
   try {
     const response = await fetch("/api/explain", {
@@ -159,13 +194,7 @@ async function runExplainRequest() {
       throw new Error(data.error || "Request failed.");
     }
 
-    if (data?.meta?.type === "video" && data?.meta?.frameCount) {
-      result.textContent = `[Video summary from ${data.meta.frameCount} sampled frames]\n\n${data.answer}`;
-      await annotateSubject(data.meta.subjectHint || "");
-      return;
-    }
-
-    result.textContent = data.answer;
+    result.textContent = formatExplainResult(data);
     await annotateSubject(data?.meta?.subjectHint || "");
   } catch (error) {
     result.textContent = `Error: ${error.message}`;
@@ -175,18 +204,50 @@ async function runExplainRequest() {
   }
 }
 
+function formatExplainResult(data) {
+  const analyses = data?.meta?.analyses || data?.analyses || [];
+  const header =
+    data?.meta?.type === "video" && data?.meta?.frameCount
+      ? `[Video summary from ${data.meta.frameCount} sampled frames]\n\n`
+      : "";
+
+  if (!analyses.length) {
+    return header + (data?.answer || "No model output.");
+  }
+
+  const blocks = analyses.map((analysis) => {
+    const label = analysis.modelName || analysis.modelId || "Model";
+    if (analysis.error) {
+      return `[${label}]\nError: ${analysis.error}`;
+    }
+    return `[${label}]\n${analysis.answer || "No response."}`;
+  });
+
+  return `${header}${blocks.join("\n\n")}`;
+}
+
 async function runFocusCutRequest() {
   const formData = new FormData();
   formData.append("media", selectedFile);
   formData.append("subjectHint", currentSubjectHint);
+  if (activeModelId) {
+    formData.append("modelId", activeModelId);
+  }
 
   setActionState("focus-cut", true);
   hideGeneratedLink();
   clearOverlay();
+  showFocusProgress();
+  updateFocusProgressUi({
+    stage: "upload",
+    message: "Uploading video and creating render job.",
+    progress: 1,
+    etaSeconds: null,
+  });
   result.textContent = currentSubjectHint
     ? `Creating a 9:16 crop that follows "${currentSubjectHint}"...`
     : "Finding the main subject and creating a 9:16 vertical crop...";
-  setSubjectBoxStatus("Tracking the subject and rendering a vertical clip...", "");
+  setSubjectBoxStatus("Building BIG/MID focus plan and rendering output...", "");
 
   try {
     const response = await fetch("/api/focus-cut", {
@@ -194,14 +255,21 @@ async function runFocusCutRequest() {
       body: formData,
     });
 
-    const data = await response.json();
+    const startData = await response.json();
     if (!response.ok) {
-      throw new Error(data.error || "Focus and Cut failed.");
+      throw new Error(startData.error || "Focus and Cut failed.");
     }
 
+    const data = await waitForFocusCutJob(startData.jobId);
     currentSubjectHint = data.subjectHint || currentSubjectHint;
     showGeneratedLink(data.outputUrl, data.downloadName);
     previewRenderedVideo(data.outputUrl);
+    updateFocusProgressUi({
+      stage: "complete",
+      message: "Focus cut complete.",
+      progress: 100,
+      etaSeconds: 0,
+    });
     result.textContent =
       `[Focus and cut ready]\n\n` +
       `Subject: ${data.subjectHint || data.renderSubject}\n` +
@@ -211,6 +279,7 @@ async function runFocusCutRequest() {
       "ready",
     );
   } catch (error) {
+    hideFocusProgress();
     result.textContent = `Error: ${error.message}`;
     setSubjectBoxStatus("Could not create the focused 9:16 crop.", "warn");
   } finally {
@@ -218,11 +287,108 @@ async function runFocusCutRequest() {
   }
 }
 
+async function waitForFocusCutJob(jobId) {
+  if (!jobId) {
+    throw new Error("Server did not return a focus-cut job id.");
+  }
+
+  while (true) {
+    const response = await fetch(`/api/focus-cut/jobs/${encodeURIComponent(jobId)}?t=${Date.now()}`);
+    const job = await response.json();
+    if (!response.ok) {
+      throw new Error(job.error || "Could not fetch focus-cut job status.");
+    }
+
+    updateFocusProgressUi(job);
+
+    if (job.status === "completed") {
+      return job;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.error || "Focus and Cut failed.");
+    }
+
+    await delay(FOCUS_POLL_INTERVAL_MS);
+  }
+}
+
+function showFocusProgress() {
+  focusProgress.classList.remove("hidden");
+}
+
+function hideFocusProgress() {
+  focusProgress.classList.add("hidden");
+}
+
+function updateFocusProgressUi(job) {
+  showFocusProgress();
+  const percent = Math.max(0, Math.min(100, Math.round(Number(job?.progress) || 0)));
+  focusProgressFill.style.width = `${percent}%`;
+  focusProgressPercent.textContent = `${percent}%`;
+  focusProgressStage.textContent = formatFocusStage(job?.stage);
+  focusProgressDetail.textContent = job?.message || "";
+
+  if (typeof job?.etaSeconds === "number" && Number.isFinite(job.etaSeconds)) {
+    focusProgressEta.textContent =
+      job.etaSeconds <= 0
+        ? "Done"
+        : `${formatDuration(Math.round(job.etaSeconds))} left`;
+  } else {
+    focusProgressEta.textContent = percent >= 100 ? "Done" : "Estimating time left...";
+  }
+}
+
+function formatFocusStage(stage) {
+  const value = String(stage || "").toLowerCase();
+  if (value === "queued" || value === "upload") {
+    return "Queued";
+  }
+  if (value === "preparing") {
+    return "Preparing";
+  }
+  if (value === "subject") {
+    return "Detecting Subject";
+  }
+  if (value === "planning") {
+    return "AI Layout Planning";
+  }
+  if (value === "rendering") {
+    return "Rendering";
+  }
+  if (value === "muxing") {
+    return "Finalizing";
+  }
+  if (value === "complete" || value === "completed") {
+    return "Complete";
+  }
+  if (value === "failed") {
+    return "Failed";
+  }
+  return "Processing";
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  if (mins > 0) {
+    return `${mins}m ${secs}s`;
+  }
+  return `${secs}s`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function setSelectedFile(file) {
   selectedFile = file;
   currentSubjectHint = "";
   stopVideoDetection();
   hideGeneratedLink();
+  hideFocusProgress();
   clearOverlay();
 
   if (previewUrl) {
@@ -448,10 +614,89 @@ function stopVideoDetection() {
 function setActionState(activeAction, isBusy) {
   explainButton.disabled = isBusy;
   focusCutButton.disabled = isBusy;
+  modelSelect.disabled = isBusy || modelSwitchInFlight;
   explainButton.textContent =
     isBusy && activeAction === "explain" ? "Thinking..." : EXPLAIN_BUTTON_TEXT;
   focusCutButton.textContent =
     isBusy && activeAction === "focus-cut" ? "Focusing..." : FOCUS_CUT_BUTTON_TEXT;
+}
+
+function syncModelSelector(status) {
+  const models = Array.isArray(status?.models) ? status.models : [];
+  if (!models.length) {
+    return;
+  }
+
+  const optionsChanged =
+    modelSelect.options.length !== models.length ||
+    models.some((model, index) => modelSelect.options[index]?.value !== model.id);
+
+  if (optionsChanged) {
+    modelSelect.innerHTML = "";
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent =
+        model.modelExists && model.mmprojExists
+          ? model.name
+          : `${model.name} (missing files)`;
+      option.disabled = !(model.modelExists && model.mmprojExists);
+      modelSelect.appendChild(option);
+    }
+  }
+
+  const reportedActiveId = String(status?.activeModelId || "").trim();
+  const fallbackModelId = models.find((model) => model.modelExists && model.mmprojExists)?.id || models[0].id;
+  if (!modelSwitchInFlight) {
+    activeModelId = reportedActiveId || fallbackModelId;
+    if (activeModelId) {
+      modelSelect.value = activeModelId;
+    }
+  }
+}
+
+function getActiveModelName() {
+  const selected = modelSelect.options[modelSelect.selectedIndex];
+  return selected?.textContent?.replace(/\s+\(missing files\)$/, "") || "selected model";
+}
+
+async function activateSelectedModel() {
+  const targetModelId = String(modelSelect.value || "").trim();
+  if (!targetModelId || targetModelId === activeModelId) {
+    return;
+  }
+
+  modelSwitchInFlight = true;
+  setActionState("model", true);
+  statusPill.textContent = `Switching to ${getActiveModelName()}...`;
+  statusPill.classList.remove("ready");
+  result.textContent = `Switching model to ${getActiveModelName()}...`;
+
+  try {
+    const response = await fetch("/api/activate-model", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        modelId: targetModelId,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Failed to activate model.");
+    }
+    activeModelId = data.activeModelId || targetModelId;
+    statusPill.textContent = `Models ready (${data.activeModelName || getActiveModelName()} active)`;
+    statusPill.classList.add("ready");
+    result.textContent = `${data.activeModelName || getActiveModelName()} loaded. Previous model was unloaded from RAM.`;
+  } catch (error) {
+    result.textContent = `Error: ${error.message}`;
+    await refreshStatus();
+  } finally {
+    modelSwitchInFlight = false;
+    setActionState("model", false);
+  }
 }
 
 function showGeneratedLink(url, downloadName) {
