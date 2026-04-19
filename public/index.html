@@ -37,6 +37,38 @@
             <select id="model-select"></select>
           </label>
 
+          <div class="field">
+            <div class="field-head">
+              <span>Layout</span>
+              <span class="field-note">Choose the 9:16 composition mode</span>
+            </div>
+            <div id="layout-picker" class="layout-picker" role="radiogroup" aria-label="Layout mode">
+              <button type="button" class="layout-option" data-layout="fill" aria-pressed="false">
+                <span class="layout-icon">⤢</span>
+                <span class="layout-name">Fill</span>
+              </button>
+              <button type="button" class="layout-option" data-layout="fit" aria-pressed="false">
+                <span class="layout-icon">⤡</span>
+                <span class="layout-name">Fit</span>
+              </button>
+              <button type="button" class="layout-option" data-layout="three" aria-pressed="false">
+                <span class="layout-icon">◫</span>
+                <span class="layout-name">Three</span>
+              </button>
+              <button type="button" class="layout-option" data-layout="four" aria-pressed="false">
+                <span class="layout-icon">▦</span>
+                <span class="layout-name">Four</span>
+              </button>
+              <button type="button" class="layout-option active" data-layout="split" aria-pressed="true">
+                <span class="layout-icon">☰</span>
+                <span class="layout-name">Split</span>
+              </button>
+            </div>
+            <div id="layout-description" class="layout-description">
+              Split: divide the frame into two readable sections for speaker plus demo, gameplay, or comparison content.
+            </div>
+          </div>
+
           <div id="preview-wrap" class="preview-wrap hidden">
             <div class="preview-stage">
               <img id="preview-image" alt="Selected preview" class="hidden" />
@@ -44,6 +76,12 @@
               <canvas id="overlay-canvas" class="overlay-canvas hidden"></canvas>
             </div>
             <div id="subject-box-status" class="subject-box-status hidden"></div>
+          </div>
+
+          <div id="video-duration-wrap" class="field hidden">
+            <span id="video-duration-label">Process duration</span>
+            <input id="video-duration-slider" type="range" min="1" max="1" step="1" value="1" />
+            <div id="video-duration-value" class="slider-value"></div>
           </div>
 
           <label class="field">
@@ -70,9 +108,13 @@
           <h2>Result</h2>
           <span id="status-pill" class="pill">Checking model...</span>
         </div>
+        <div id="result-meta" class="result-meta hidden"></div>
         <a id="generated-link" class="generated-link hidden" href="#" rel="noopener">
-          Download Output Video
+          Open Output Video
         </a>
+        <div id="output-video-wrap" class="output-video-wrap hidden">
+          <video id="output-video" class="output-video" controls playsinline preload="metadata"></video>
+        </div>
         <div id="focus-progress" class="focus-progress hidden" aria-live="polite">
           <div class="focus-progress-head">
             <span id="focus-progress-stage">Preparing...</span>

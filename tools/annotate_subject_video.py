@@ -5,6 +5,7 @@ import base64
 import json
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -18,6 +19,9 @@ import mediapipe as mp
 import pytesseract
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FAST_VERTICAL_OUTPUT_HEIGHT = max(480, int(os.environ.get("FOCUS_OUTPUT_HEIGHT", "720")))
+DEFAULT_DETECT_EVERY_N = max(1, int(os.environ.get("FOCUS_DETECT_EVERY_N", "1")))
+DEFAULT_FACE_DETECT_EVERY_N = max(1, int(os.environ.get("FOCUS_FACE_DETECT_EVERY_N", "1")))
 FOCUS_STYLE_RULES_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "config", "focus-style-rules.md")
 )
@@ -150,6 +154,14 @@ SUBJECT_ALIASES = {
     "guest": HUMAN_LABELS,
 }
 
+SCREEN_LIKE_LABELS = {
+    "tv",
+    "monitor",
+    "laptop",
+    "cell phone",
+    "book",
+}
+
 
 @dataclass
 class Box:
@@ -198,6 +210,17 @@ class LayoutMetrics:
     use_wide: bool
     subject_span_ratio: float
     candidate_count: int
+
+
+@dataclass
+class ROI:
+    box: Box
+    semantic_type: str
+    confidence: float
+    score: float
+    track_id: Optional[int] = None
+    source_label: str = ""
+    stability: float = 0.0
 
 
 def load_focus_style_rules_text() -> str:
@@ -325,6 +348,45 @@ def smooth_box(prev: Optional[Box], curr: Box, alpha: float = 0.65) -> Box:
         label=curr.label,
         conf=curr.conf,
     )
+
+
+def smooth_roi(prev: Optional[ROI], curr: ROI, alpha: float = 0.45) -> ROI:
+    if prev is None:
+        return curr
+    return ROI(
+        box=smooth_box(prev.box, curr.box, alpha=alpha),
+        semantic_type=curr.semantic_type,
+        confidence=prev.confidence * (1.0 - alpha) + curr.confidence * alpha,
+        score=prev.score * (1.0 - alpha) + curr.score * alpha,
+        track_id=curr.track_id if curr.track_id is not None else prev.track_id,
+        source_label=curr.source_label or prev.source_label,
+        stability=max(prev.stability, curr.stability),
+    )
+
+
+def center_distance_ratio(a: Box, b: Box, frame_w: int, frame_h: int) -> float:
+    dx = (a.center()[0] - b.center()[0]) / max(frame_w, 1)
+    dy = (a.center()[1] - b.center()[1]) / max(frame_h, 1)
+    return math.hypot(dx, dy)
+
+
+def is_hard_box_switch(
+    prev: Optional[Box],
+    curr: Optional[Box],
+    frame_w: int,
+    center_jump_ratio: float = 0.18,
+    min_iou: float = 0.12,
+) -> bool:
+    if prev is None or curr is None:
+        return False
+    if prev.label != curr.label:
+        return True
+
+    center_jump = abs(curr.center()[0] - prev.center()[0]) / max(frame_w, 1)
+    if center_jump >= center_jump_ratio:
+        return True
+
+    return iou(prev, curr) < min_iou
 
 
 def is_human_subject(subject: str) -> bool:
@@ -751,6 +813,244 @@ def derive_speaker_anchor_box(subject_box: Optional[Box], frame_w: int, frame_h:
     )
 
 
+def classify_roi_semantic(label: str) -> str:
+    normalized = (label or "").lower().strip()
+    if normalized in {"speaker"}:
+        return "speaker"
+    if normalized in HUMAN_LABELS or normalized == "face":
+        return "face"
+    if normalized in SCREEN_LIKE_LABELS:
+        return "screen"
+    return "object"
+
+
+def expand_roi_box_for_split(roi: ROI, frame_w: int, frame_h: int) -> Box:
+    box = roi.box
+    if roi.semantic_type in {"face", "speaker"}:
+        return expand_face_to_tracking_box(box, frame_w, frame_h)
+
+    pad_x = box.w * (0.26 if roi.semantic_type == "screen" else 0.20)
+    pad_y = box.h * (0.20 if roi.semantic_type == "screen" else 0.18)
+    x = clamp(box.x - pad_x, 0, frame_w - 1)
+    y = clamp(box.y - pad_y, 0, frame_h - 1)
+    w = min(box.w + pad_x * 2.0, frame_w - x)
+    h = min(box.h + pad_y * 2.0, frame_h - y)
+    return Box(x=x, y=y, w=w, h=h, label=box.label, conf=box.conf)
+
+
+def match_boxes_to_track_ids(
+    boxes: list[Box],
+    previous_tracks: list[tuple[int, Box]],
+    next_track_id: int,
+    min_iou: float = 0.18,
+) -> tuple[list[tuple[Box, int]], list[tuple[int, Box]], int]:
+    assigned = []
+    next_tracks = []
+    used_track_ids = set()
+
+    for box in boxes:
+        best_track_id = None
+        best_iou = 0.0
+        for track_id, prev_box in previous_tracks:
+            if track_id in used_track_ids:
+                continue
+            overlap = iou(box, prev_box)
+            if overlap > best_iou:
+                best_iou = overlap
+                best_track_id = track_id
+        if best_track_id is None or best_iou < min_iou:
+            best_track_id = next_track_id
+            next_track_id += 1
+        used_track_ids.add(best_track_id)
+        assigned.append((box, best_track_id))
+        next_tracks.append((best_track_id, box))
+
+    return assigned, next_tracks, next_track_id
+
+
+def crop_box_region(frame, box: Box):
+    x1 = int(clamp(box.x, 0, frame.shape[1] - 1))
+    y1 = int(clamp(box.y, 0, frame.shape[0] - 1))
+    x2 = int(clamp(box.x + box.w, x1 + 1, frame.shape[1]))
+    y2 = int(clamp(box.y + box.h, y1 + 1, frame.shape[0]))
+    return frame[y1:y2, x1:x2]
+
+
+def compute_region_similarity(frame, a: Box, b: Box) -> float:
+    region_a = crop_box_region(frame, a)
+    region_b = crop_box_region(frame, b)
+    if region_a.size == 0 or region_b.size == 0:
+        return 0.0
+
+    region_a = cv2.resize(region_a, (64, 64), interpolation=cv2.INTER_AREA)
+    region_b = cv2.resize(region_b, (64, 64), interpolation=cv2.INTER_AREA)
+    hsv_a = cv2.cvtColor(region_a, cv2.COLOR_BGR2HSV)
+    hsv_b = cv2.cvtColor(region_b, cv2.COLOR_BGR2HSV)
+    hist_a = cv2.calcHist([hsv_a], [0, 1], None, [12, 8], [0, 180, 0, 256])
+    hist_b = cv2.calcHist([hsv_b], [0, 1], None, [12, 8], [0, 180, 0, 256])
+    cv2.normalize(hist_a, hist_a, alpha=1.0, norm_type=cv2.NORM_L1)
+    cv2.normalize(hist_b, hist_b, alpha=1.0, norm_type=cv2.NORM_L1)
+    similarity = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
+    return float(clamp(similarity, -1.0, 1.0))
+
+
+def build_roi(
+    box: Box,
+    semantic_type: str,
+    frame_w: int,
+    frame_h: int,
+    confidence: Optional[float] = None,
+    track_id: Optional[int] = None,
+    source_label: Optional[str] = None,
+    prior_roi: Optional[ROI] = None,
+) -> ROI:
+    area_ratio = box.area() / max(frame_w * frame_h, 1)
+    stability = iou(prior_roi.box, box) if prior_roi is not None else 0.0
+    score = (confidence if confidence is not None else box.conf) * 0.65 + min(area_ratio / 0.20, 1.0) * 0.35
+    return ROI(
+        box=box,
+        semantic_type=semantic_type,
+        confidence=float(confidence if confidence is not None else box.conf),
+        score=float(score),
+        track_id=track_id,
+        source_label=source_label or box.label,
+        stability=float(stability),
+    )
+
+
+def validate_split_candidates(
+    frame,
+    primary_roi: Optional[ROI],
+    secondary_roi: Optional[ROI],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[bool, str]:
+    if primary_roi is None or secondary_roi is None:
+        return False, "missing_roi"
+    if secondary_roi.confidence < 0.16 or secondary_roi.score < 0.24:
+        return False, "secondary_too_weak"
+    if secondary_roi.box.area() / max(frame_w * frame_h, 1) < 0.012:
+        return False, "secondary_too_small"
+    if primary_roi.track_id is not None and primary_roi.track_id == secondary_roi.track_id:
+        return False, "same_track"
+
+    overlap = iou(primary_roi.box, secondary_roi.box)
+    if overlap > 0.34:
+        return False, "overlap_too_high"
+
+    distance = center_distance_ratio(primary_roi.box, secondary_roi.box, frame_w, frame_h)
+    primary_area = max(primary_roi.box.area(), 1.0)
+    secondary_area = max(secondary_roi.box.area(), 1.0)
+    area_similarity = min(primary_area, secondary_area) / max(primary_area, secondary_area)
+    visual_similarity = compute_region_similarity(frame, primary_roi.box, secondary_roi.box)
+    same_semantic = primary_roi.semantic_type == secondary_roi.semantic_type
+    same_label = primary_roi.source_label == secondary_roi.source_label
+
+    if distance < 0.12 and area_similarity > 0.70:
+        return False, "geometry_too_similar"
+
+    # Split must never duplicate the same subject in two panels with only a zoom change.
+    if same_semantic and same_label and visual_similarity > 0.72:
+        return False, "duplicate_subject"
+
+    if same_semantic and visual_similarity > 0.84:
+        return False, "semantic_duplicate"
+
+    if secondary_roi.stability < 0.10 and secondary_roi.semantic_type in {"face", "speaker", "screen"}:
+        return False, "unstable_secondary"
+
+    return True, "ok"
+
+
+def choose_split_secondary_roi(
+    frame,
+    primary_roi: Optional[ROI],
+    face_rois: list[ROI],
+    object_rois: list[ROI],
+    active_secondary_roi: Optional[ROI],
+    frame_w: int,
+    frame_h: int,
+) -> Optional[ROI]:
+    def collect_ranked(rois: list[ROI], face_priority: bool) -> list[tuple[float, ROI]]:
+        ranked = []
+        for roi in rois:
+            valid, _ = validate_split_candidates(frame, primary_roi, roi, frame_w, frame_h)
+            if not valid:
+                continue
+
+            score = roi.score
+            if face_priority and roi.semantic_type in {"face", "speaker"}:
+                score += 0.28
+            elif roi.semantic_type in {"screen", "object"}:
+                score += 0.05
+            if active_secondary_roi is not None:
+                if roi.track_id is not None and roi.track_id == active_secondary_roi.track_id:
+                    score += 0.18
+                score += iou(active_secondary_roi.box, roi.box) * 0.22
+            ranked.append((score, roi))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked
+
+    face_candidates = collect_ranked(face_rois, face_priority=True)
+    if face_candidates:
+        return face_candidates[0][1]
+
+    object_candidates = collect_ranked(object_rois, face_priority=False)
+    if object_candidates:
+        return object_candidates[0][1]
+
+    return None
+
+
+def build_context_fallback_roi(
+    frame_w: int,
+    frame_h: int,
+    primary_roi: Optional[ROI],
+    previous_roi: Optional[ROI],
+) -> ROI:
+    # Split mode must remain split for the whole clip. When we do not have a strong
+    # second subject/listener/object, the bottom panel shows a stable context region
+    # away from the primary speaker instead of collapsing back to a single-panel view.
+    box_w = frame_w * 0.92
+    box_h = min(frame_h * 0.54, box_w / max(1.05, frame_w / max(frame_h, 1)))
+    box_h = max(frame_h * 0.38, box_h)
+    x = (frame_w - box_w) * 0.5
+    y = frame_h - box_h - frame_h * 0.04
+
+    if primary_roi is not None:
+        primary_center_x, primary_center_y = primary_roi.box.center()
+        if primary_center_y > frame_h * 0.52:
+            y = frame_h * 0.05
+        elif primary_center_x < frame_w * 0.45:
+            x = frame_w * 0.08
+        elif primary_center_x > frame_w * 0.55:
+            x = frame_w - box_w - frame_w * 0.08
+
+    box = Box(
+        x=clamp(x, 0, frame_w - 1),
+        y=clamp(y, 0, frame_h - 1),
+        w=min(box_w, frame_w - x),
+        h=min(box_h, frame_h - y),
+        label="context",
+        conf=0.35,
+    )
+    roi = build_roi(
+        box,
+        "context",
+        frame_w,
+        frame_h,
+        confidence=0.35,
+        source_label="context",
+        prior_roi=previous_roi,
+    )
+    if previous_roi is not None:
+        roi = smooth_roi(previous_roi, roi, alpha=0.20)
+        roi.semantic_type = "context"
+        roi.source_label = "context"
+        roi.track_id = None
+    return roi
+
+
 def compute_crop_window(
     frame_w: int,
     frame_h: int,
@@ -802,6 +1102,101 @@ def compute_crop_window(
     x = int(round(center_x - half_w))
     y = 0
     return CropWindow(x=x, y=y, w=crop_w, h=crop_h), center_x
+
+
+def smooth_crop_window(prev: Optional[CropWindow], curr: CropWindow, alpha: float = 0.24) -> CropWindow:
+    if prev is None:
+        return curr
+    return CropWindow(
+        x=prev.x * (1.0 - alpha) + curr.x * alpha,
+        y=prev.y * (1.0 - alpha) + curr.y * alpha,
+        w=prev.w * (1.0 - alpha) + curr.w * alpha,
+        h=prev.h * (1.0 - alpha) + curr.h * alpha,
+    )
+
+
+def keep_crop_covering_box(crop: CropWindow, focus_box: Box, frame_w: int, frame_h: int) -> CropWindow:
+    x = clamp(crop.x, 0, frame_w - crop.w)
+    y = clamp(crop.y, 0, frame_h - crop.h)
+
+    if x > focus_box.x:
+        x = focus_box.x
+    if x + crop.w < focus_box.x + focus_box.w:
+        x = focus_box.x + focus_box.w - crop.w
+
+    if y > focus_box.y:
+        y = focus_box.y
+    if y + crop.h < focus_box.y + focus_box.h:
+        y = focus_box.y + focus_box.h - crop.h
+
+    return CropWindow(
+        x=clamp(x, 0, frame_w - crop.w),
+        y=clamp(y, 0, frame_h - crop.h),
+        w=crop.w,
+        h=crop.h,
+    )
+
+
+def compute_panel_crop_window(
+    frame_w: int,
+    frame_h: int,
+    roi: Optional[ROI],
+    target_aspect: float,
+    prev_crop: Optional[CropWindow] = None,
+    force_cut: bool = False,
+) -> CropWindow:
+    if roi is None:
+        crop_h = min(frame_h, max(1.0, frame_w / max(target_aspect, 1e-6)))
+        crop_w = min(frame_w, crop_h * target_aspect)
+        x = (frame_w - crop_w) / 2.0
+        y = (frame_h - crop_h) / 2.0
+        return CropWindow(x=x, y=y, w=crop_w, h=crop_h)
+
+    focus_box = expand_roi_box_for_split(roi, frame_w, frame_h)
+    if roi.semantic_type in {"face", "speaker"}:
+        pad_x_ratio = 0.08
+        pad_y_ratio = 0.10
+    elif roi.semantic_type == "screen":
+        pad_x_ratio = 0.06
+        pad_y_ratio = 0.08
+    else:
+        pad_x_ratio = 0.10
+        pad_y_ratio = 0.12
+
+    required_w = focus_box.w * (1.0 + pad_x_ratio * 2.0)
+    required_h = focus_box.h * (1.0 + pad_y_ratio * 2.0)
+    crop_h = max(required_h, required_w / max(target_aspect, 1e-6))
+    crop_w = crop_h * target_aspect
+
+    if crop_w > frame_w:
+        crop_w = float(frame_w)
+        crop_h = crop_w / max(target_aspect, 1e-6)
+    if crop_h > frame_h:
+        crop_h = float(frame_h)
+        crop_w = crop_h * target_aspect
+
+    crop_w = min(float(frame_w), max(crop_w, focus_box.w))
+    crop_h = min(float(frame_h), max(crop_h, focus_box.h))
+
+    desired_center_x, desired_center_y = focus_box.center()
+    if roi.semantic_type in {"face", "speaker"}:
+        desired_center_y = focus_box.y + focus_box.h * 0.44
+
+    raw_crop = CropWindow(
+        x=desired_center_x - crop_w / 2.0,
+        y=desired_center_y - crop_h / 2.0,
+        w=crop_w,
+        h=crop_h,
+    )
+    raw_crop = keep_crop_covering_box(raw_crop, focus_box, frame_w, frame_h)
+    if force_cut or prev_crop is None:
+        return raw_crop
+    return keep_crop_covering_box(
+        smooth_crop_window(prev_crop, raw_crop, alpha=0.26),
+        focus_box,
+        frame_w,
+        frame_h,
+    )
 
 
 def crop_frame(frame, crop: CropWindow, output_w: int, output_h: int):
@@ -883,6 +1278,78 @@ def compose_center_with_blur_bg_frame(frame, output_w: int, output_h: int):
     composed = background.copy()
     composed[offset_y : offset_y + fg_h, offset_x : offset_x + fg_w] = foreground
     return composed, fg_w / max(frame.shape[1], 1), fg_h / max(frame.shape[0], 1), offset_x, offset_y
+
+
+def compose_split_vertical_frame(
+    frame,
+    top_crop: CropWindow,
+    bottom_crop: CropWindow,
+    output_w: int,
+    output_h: int,
+):
+    margin = max(10, int(round(output_w * 0.03)))
+    gap = max(10, int(round(output_h * 0.018)))
+    panel_w = max(1, output_w - margin * 2)
+    usable_h = max(1, output_h - margin * 2 - gap)
+    top_h = max(1, int(round(usable_h * 0.56)))
+    bottom_h = max(1, usable_h - top_h)
+    top_x = margin
+    top_y = margin
+    bottom_x = margin
+    bottom_y = top_y + top_h + gap
+
+    background = build_blurred_background(frame, output_w, output_h)
+    canvas = background.copy()
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (0, 0), (output_w, output_h), (14, 16, 20), -1)
+    cv2.addWeighted(overlay, 0.18, canvas, 0.82, 0, canvas)
+
+    top_frame = crop_frame(frame, top_crop, panel_w, top_h)
+    bottom_frame = crop_frame(frame, bottom_crop, panel_w, bottom_h)
+
+    card_overlay = canvas.copy()
+    cv2.rectangle(card_overlay, (top_x - 4, top_y - 4), (top_x + panel_w + 4, top_y + top_h + 4), (0, 0, 0), -1)
+    cv2.rectangle(
+        card_overlay,
+        (bottom_x - 4, bottom_y - 4),
+        (bottom_x + panel_w + 4, bottom_y + bottom_h + 4),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(card_overlay, 0.22, canvas, 0.78, 0, canvas)
+
+    canvas[top_y : top_y + top_h, top_x : top_x + panel_w] = top_frame
+    canvas[bottom_y : bottom_y + bottom_h, bottom_x : bottom_x + panel_w] = bottom_frame
+
+    cv2.rectangle(canvas, (top_x, top_y), (top_x + panel_w, top_y + top_h), (242, 244, 247), 2)
+    cv2.rectangle(
+        canvas,
+        (bottom_x, bottom_y),
+        (bottom_x + panel_w, bottom_y + bottom_h),
+        (242, 244, 247),
+        2,
+    )
+
+    return {
+        "frame": canvas,
+        "top_panel": {
+            "x": top_x,
+            "y": top_y,
+            "w": panel_w,
+            "h": top_h,
+            "scale_x": panel_w / max(top_crop.w, 1),
+            "scale_y": top_h / max(top_crop.h, 1),
+        },
+        "bottom_panel": {
+            "x": bottom_x,
+            "y": bottom_y,
+            "w": panel_w,
+            "h": bottom_h,
+            "scale_x": panel_w / max(bottom_crop.w, 1),
+            "scale_y": bottom_h / max(bottom_crop.h, 1),
+            "source_box": bottom_crop,
+        },
+    }
 
 
 def fit_inside(src_w: int, src_h: int, max_w: int, max_h: int) -> tuple[int, int]:
@@ -1987,7 +2454,7 @@ def parse_aspect_ratio(value: str) -> float:
 
 def compute_output_size(target_aspect: float) -> tuple[int, int]:
     if target_aspect <= 1.0:
-        out_h = 1280 if target_aspect < 0.8 else 720
+        out_h = FAST_VERTICAL_OUTPUT_HEIGHT if target_aspect < 0.8 else 720
         out_w = max(1, int(round(out_h * target_aspect)))
     else:
         out_w = 1280
@@ -2003,7 +2470,10 @@ def annotate_video(
     target_aspect: Optional[float] = None,
     draw_subject_box: bool = True,
     source_inset: bool = False,
-    focus_plan: Optional[list[FocusPlanPoint]] = None,
+    detect_every_n: int = DEFAULT_DETECT_EVERY_N,
+    face_detect_every_n: int = DEFAULT_FACE_DETECT_EVERY_N,
+    duration_limit_sec: Optional[float] = None,
+    layout_mode: str = "fill",
 ):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -2013,11 +2483,13 @@ def annotate_video(
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if duration_limit_sec is not None and duration_limit_sec > 0 and fps > 0:
+        frame_count = min(frame_count, max(1, int(math.ceil(duration_limit_sec * fps))))
     out_width = width
     out_height = height
 
     crop_active = target_aspect is not None
-    use_blurred_fill = crop_active and target_aspect is not None and target_aspect < 0.8
+    use_blurred_fill = False
     crop_target_aspect = target_aspect
     if crop_active:
         out_width, out_height = compute_output_size(target_aspect)
@@ -2038,108 +2510,203 @@ def annotate_video(
     face_detector = build_face_detector() if speaker_mode else None
     prev_box = None
     prev_face_box = None
+    previous_face_tracks: list[tuple[int, Box]] = []
+    next_face_track_id = 1
+    active_secondary_roi: Optional[ROI] = None
+    prev_top_split_crop: Optional[CropWindow] = None
+    prev_bottom_split_crop: Optional[CropWindow] = None
     missing_count = 0
     prev_center_x = None
     box_alpha = 0.28 if speaker_mode and crop_active else 0.65
     max_missing = 30 if speaker_mode and crop_active else 12
-    active_plan_index = -1
-    active_plan_point = None
-    crop_width = min(width, int(round(height * crop_target_aspect))) if crop_active else width
-    transition_frames = max(1, int(round(fps * 0.22))) if use_blurred_fill else 1
-    wide_enter_frames = max(2, int(round(fps * 0.18))) if use_blurred_fill else 1
-    wide_exit_frames = max(wide_enter_frames + 1, int(round(fps * 0.28))) if use_blurred_fill else 1
-    wide_target = False
-    wide_enter_streak = 0
-    wide_exit_streak = 0
-    layout_blend = 0.0
+    detect_every_n = max(1, int(detect_every_n))
+    face_detect_every_n = max(1, int(face_detect_every_n))
     render_started_at = time.monotonic()
     last_render_emit_at = 0.0
     emit_progress(
         "rendering",
         current=0,
         total=frame_count if frame_count > 0 else None,
-        message="Rendering 9:16 video frames.",
+        message="Rendering split 9:16 layout." if layout_mode == "split" else "Rendering 9:16 crop.",
     )
     try:
         for frame_idx, frame in iter_video_frames(cap):
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(frame_idx * 1000.0 / fps)
-            current_time_sec = frame_idx / fps
-
+            if frame_idx >= frame_count:
+                break
+            rgb = None
             force_cut = False
-            if focus_plan:
-                while (
-                    active_plan_index + 1 < len(focus_plan)
-                    and focus_plan[active_plan_index + 1].time_sec <= current_time_sec
-                ):
-                    active_plan_index += 1
-                    active_plan_point = focus_plan[active_plan_index]
-                    force_cut = active_plan_point.snap_cut
-
             guided_center_x = None
-            model_prefers_wide = False
-            if active_plan_point is not None:
-                guided_center_x = active_plan_point.center_x * width
-                model_prefers_wide = active_plan_point.prefer_wide
-            effective_speaker_mode = speaker_mode or (
-                active_plan_point is not None
-                and active_plan_point.label.lower() in HUMAN_LABELS
-            )
+            effective_speaker_mode = speaker_mode
 
-            result = detector.detect_for_video(mp_image, timestamp_ms)
-            candidate_boxes = (
-                select_candidate_boxes(result.detections, subject_name, width, height, limit=3)
-                if crop_active
-                else []
-            )
-            subject_box = choose_box(
-                result.detections,
-                subject_name,
-                prev_box,
-                width,
-                height,
-                guided_center_x=guided_center_x,
-            )
+            should_detect = frame_idx == 0 or prev_box is None or frame_idx % detect_every_n == 0
+            subject_box = None
+            result = None
+            face_boxes: list[Box] = []
+            face_box = None
+            if should_detect:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int(frame_idx * 1000.0 / fps)
+                result = detector.detect_for_video(mp_image, timestamp_ms)
+                subject_box = choose_box(
+                    result.detections,
+                    subject_name,
+                    prev_box,
+                    width,
+                    height,
+                    guided_center_x=guided_center_x,
+                )
             tracking_box = derive_speaker_anchor_box(subject_box, width, height) if speaker_mode else subject_box
             speaker_visible = not effective_speaker_mode
 
             if speaker_mode and face_detector is not None:
-                face_boxes = detect_face_boxes(face_detector, rgb, width, height)
-                face_box = choose_face_box(
-                    face_boxes,
-                    prev_face_box,
-                    width,
-                    height,
-                    guided_center_x=guided_center_x,
-                    subject_box=subject_box,
-                    )
-                if face_box is not None:
-                    speaker_visible = True
-                    if (
-                        prev_face_box is None
-                        or abs(face_box.center()[0] - prev_face_box.center()[0]) > width * 0.10
-                    ):
-                        prev_face_box = face_box
-                        force_cut = True
-                    else:
-                        prev_face_box = smooth_box(prev_face_box, face_box, alpha=0.55)
-                    tracking_box = expand_face_to_tracking_box(prev_face_box, width, height)
+                should_detect_face = should_detect and (frame_idx % face_detect_every_n == 0)
+                if should_detect_face:
+                    if rgb is None:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    face_boxes = detect_face_boxes(face_detector, rgb, width, height)
+                    face_box = choose_face_box(
+                        face_boxes,
+                        prev_face_box,
+                        width,
+                        height,
+                        guided_center_x=guided_center_x,
+                        subject_box=subject_box,
+                        )
+                    if face_box is not None:
+                        speaker_visible = True
+                        if is_hard_box_switch(
+                            prev_face_box,
+                            face_box,
+                            width,
+                            center_jump_ratio=0.10,
+                            min_iou=0.18,
+                        ):
+                            prev_face_box = face_box
+                            force_cut = True
+                        else:
+                            prev_face_box = smooth_box(prev_face_box, face_box, alpha=0.55)
+                        tracking_box = expand_face_to_tracking_box(prev_face_box, width, height)
+                    elif subject_box is None and prev_face_box is not None and missing_count < max_missing:
+                        tracking_box = expand_face_to_tracking_box(prev_face_box, width, height)
+                        subject_box = tracking_box
+                    elif subject_box is not None:
+                        prev_face_box = None
+                    elif subject_box is None:
+                        speaker_visible = False
                 elif subject_box is None and prev_face_box is not None and missing_count < max_missing:
                     tracking_box = expand_face_to_tracking_box(prev_face_box, width, height)
                     subject_box = tracking_box
-                elif subject_box is not None:
-                    prev_face_box = None
-                elif subject_box is None:
-                    speaker_visible = False
 
             if effective_speaker_mode and subject_box is not None and subject_box.label in HUMAN_LABELS:
                 speaker_visible = True
 
             current_box = tracking_box
             display_box = subject_box if subject_box is not None else tracking_box
+            primary_roi = None
+            face_rois: list[ROI] = []
+            object_rois: list[ROI] = []
+
+            if face_boxes:
+                matched_faces, previous_face_tracks, next_face_track_id = match_boxes_to_track_ids(
+                    face_boxes,
+                    previous_face_tracks,
+                    next_face_track_id,
+                )
+                primary_face_track_id = None
+                if prev_face_box is not None:
+                    for raw_face_box, track_id in matched_faces:
+                        if iou(raw_face_box, prev_face_box) > 0.35:
+                            primary_face_track_id = track_id
+                            break
+                for raw_face_box, track_id in matched_faces:
+                    prior_face_roi = active_secondary_roi if active_secondary_roi and active_secondary_roi.track_id == track_id else None
+                    roi = build_roi(
+                        raw_face_box,
+                        "face" if track_id != primary_face_track_id else "speaker",
+                        width,
+                        height,
+                        confidence=raw_face_box.conf,
+                        track_id=track_id,
+                        source_label="face",
+                        prior_roi=prior_face_roi,
+                    )
+                    face_rois.append(roi)
+            elif frame_idx == 0 or should_detect:
+                previous_face_tracks = []
+
+            if prev_face_box is not None:
+                primary_track_id = None
+                for roi in face_rois:
+                    if iou(roi.box, prev_face_box) > 0.35:
+                        primary_track_id = roi.track_id
+                        break
+                primary_box = expand_face_to_tracking_box(prev_face_box, width, height)
+                primary_roi = build_roi(
+                    primary_box,
+                    "speaker",
+                    width,
+                    height,
+                    confidence=prev_face_box.conf,
+                    track_id=primary_track_id,
+                    source_label="speaker",
+                )
+            elif display_box is not None:
+                primary_roi = build_roi(
+                    display_box,
+                    "speaker" if speaker_mode else classify_roi_semantic(display_box.label),
+                    width,
+                    height,
+                    confidence=display_box.conf,
+                    source_label=display_box.label,
+                )
+
+            if result is not None:
+                candidate_boxes = select_candidate_boxes(result.detections, subject_name, width, height, limit=5)
+                for candidate in candidate_boxes:
+                    semantic_type = classify_roi_semantic(candidate.label)
+                    if primary_roi is not None and iou(primary_roi.box, candidate) > 0.42:
+                        continue
+                    if semantic_type in {"face", "speaker"}:
+                        matching_face_track_id = None
+                        for roi in face_rois:
+                            if iou(roi.box, candidate) > 0.20:
+                                matching_face_track_id = roi.track_id
+                                break
+                        if primary_roi is not None and primary_roi.track_id is not None and matching_face_track_id == primary_roi.track_id:
+                            continue
+                        expanded_candidate = expand_face_to_tracking_box(candidate, width, height)
+                        object_rois.append(
+                            build_roi(
+                                expanded_candidate,
+                                "face",
+                                width,
+                                height,
+                                confidence=candidate.conf,
+                                track_id=matching_face_track_id,
+                                source_label=candidate.label,
+                                prior_roi=active_secondary_roi,
+                            )
+                        )
+                        continue
+                    object_rois.append(
+                        build_roi(
+                            candidate,
+                            semantic_type,
+                            width,
+                            height,
+                            confidence=candidate.conf,
+                            source_label=candidate.label,
+                            prior_roi=active_secondary_roi,
+                        )
+                    )
+
             if display_box is not None:
-                prev_box = smooth_box(prev_box, display_box, alpha=box_alpha)
+                if is_hard_box_switch(prev_box, display_box, width, center_jump_ratio=0.16, min_iou=0.10):
+                    prev_box = display_box
+                    force_cut = True
+                else:
+                    prev_box = smooth_box(prev_box, display_box, alpha=box_alpha)
                 missing_count = 0
             elif prev_box is not None and missing_count < max_missing:
                 missing_count += 1
@@ -2150,8 +2717,57 @@ def annotate_video(
             focus_box = current_box if effective_speaker_mode and current_box is not None else prev_box
             output_box = display_box if display_box is not None else focus_box
             crop = None
+            split_layout_requested = layout_mode == "split"
+            split_secondary_roi = None
+
+            if split_layout_requested:
+                secondary_face_rois = [
+                    roi for roi in face_rois
+                    if primary_roi is None
+                    or roi.track_id is None
+                    or roi.track_id != primary_roi.track_id
+                ]
+                split_secondary_roi = choose_split_secondary_roi(
+                    frame,
+                    primary_roi,
+                    secondary_face_rois,
+                    object_rois,
+                    active_secondary_roi,
+                    width,
+                    height,
+                )
+                if split_secondary_roi is None:
+                    split_secondary_roi = build_context_fallback_roi(
+                        width,
+                        height,
+                        primary_roi,
+                        active_secondary_roi,
+                    )
+
+                if active_secondary_roi is not None and (
+                    (split_secondary_roi.track_id is not None and split_secondary_roi.track_id == active_secondary_roi.track_id)
+                    or iou(split_secondary_roi.box, active_secondary_roi.box) > 0.22
+                    or split_secondary_roi.semantic_type == "context"
+                ):
+                    active_secondary_roi = smooth_roi(active_secondary_roi, split_secondary_roi, alpha=0.34)
+                    active_secondary_roi.semantic_type = split_secondary_roi.semantic_type
+                    active_secondary_roi.source_label = split_secondary_roi.source_label
+                    active_secondary_roi.track_id = split_secondary_roi.track_id
+                else:
+                    active_secondary_roi = split_secondary_roi
 
             if crop_active:
+                current_target_aspect = crop_target_aspect
+                split_layout = split_layout_requested and active_secondary_roi is not None
+                split_top_h = None
+                split_bottom_h = None
+                if split_layout:
+                    split_margin = max(10, int(round(out_width * 0.03)))
+                    split_gap = max(10, int(round(out_height * 0.018)))
+                    split_usable_h = max(1, out_height - split_margin * 2 - split_gap)
+                    split_top_h = max(1, int(round(split_usable_h * 0.56)))
+                    split_bottom_h = max(1, split_usable_h - split_top_h)
+                    current_target_aspect = (out_width - split_margin * 2) / max(split_top_h, 1)
                 if (
                     speaker_mode
                     and current_box is not None
@@ -2165,105 +2781,62 @@ def annotate_video(
                     height,
                     focus_box,
                     prev_center_x,
-                    crop_target_aspect,
+                    current_target_aspect,
                     speaker_mode=speaker_mode,
                     guided_center_x=guided_center_x,
                     force_cut=force_cut,
                 )
-                if use_blurred_fill:
-                    layout_metrics = choose_layout_metrics(
-                        candidate_boxes,
-                        display_box,
-                        crop_width,
+                if split_layout:
+                    top_roi = primary_roi
+                    bottom_roi = active_secondary_roi
+                    top_panel_aspect = (out_width - split_margin * 2) / max(split_top_h, 1)
+                    bottom_panel_aspect = (out_width - split_margin * 2) / max(split_bottom_h, 1)
+                    top_crop = compute_panel_crop_window(
                         width,
                         height,
-                        effective_speaker_mode,
-                        speaker_visible=speaker_visible,
-                        model_prefers_wide=model_prefers_wide,
+                        top_roi,
+                        top_panel_aspect,
+                        prev_crop=prev_top_split_crop,
+                        force_cut=force_cut,
                     )
-                    if layout_metrics.use_wide:
-                        wide_enter_streak += 1
-                        wide_exit_streak = 0
-                    else:
-                        wide_exit_streak += 1
-                        wide_enter_streak = 0
-
-                    if not wide_target and wide_enter_streak >= wide_enter_frames:
-                        wide_target = True
-                    elif wide_target and wide_exit_streak >= wide_exit_frames:
-                        wide_target = False
-
-                    target_blend = 1.0 if wide_target else 0.0
-                    layout_blend = move_towards(layout_blend, target_blend, 1.0 / transition_frames)
-
-                    full_scale_x = out_width / crop.w
-                    full_scale_y = out_height / crop.h
-                    full_offset_x = 0
-                    full_offset_y = 0
-                    full_frame = None
-                    wide_frame = None
-                    wide_scale_x = wide_scale_y = 1.0
-                    wide_offset_x = wide_offset_y = 0
-                    if layout_blend <= 0.001:
-                        output_frame = crop_frame(frame, crop, out_width, out_height)
-                    elif layout_blend >= 0.999:
-                        wide_frame, wide_scale_x, wide_scale_y, wide_offset_x, wide_offset_y = compose_center_with_blur_bg_frame(
-                            frame,
-                            out_width,
-                            out_height,
+                    bottom_crop = compute_panel_crop_window(
+                        width,
+                        height,
+                        bottom_roi,
+                        bottom_panel_aspect,
+                        prev_crop=prev_bottom_split_crop,
+                        force_cut=False,
+                    )
+                    prev_top_split_crop = top_crop
+                    prev_bottom_split_crop = bottom_crop
+                    split_composite = compose_split_vertical_frame(frame, top_crop, bottom_crop, out_width, out_height)
+                    output_frame = split_composite["frame"]
+                    if output_box is not None:
+                        top_panel = split_composite["top_panel"]
+                        output_box = translate_box_to_crop(
+                            output_box,
+                            top_crop,
+                            top_panel["scale_x"],
+                            top_panel["scale_y"],
                         )
-                        output_frame = wide_frame
-                    else:
-                        full_frame = crop_frame(frame, crop, out_width, out_height)
-                        wide_frame, wide_scale_x, wide_scale_y, wide_offset_x, wide_offset_y = compose_center_with_blur_bg_frame(
-                            frame,
-                            out_width,
-                            out_height,
+                        output_box = Box(
+                            x=output_box.x + top_panel["x"],
+                            y=output_box.y + top_panel["y"],
+                            w=output_box.w,
+                            h=output_box.h,
+                            label=output_box.label,
+                            conf=output_box.conf,
                         )
-                        output_frame = blend_frames(full_frame, wide_frame, layout_blend)
                 else:
+                    prev_top_split_crop = None
+                    prev_bottom_split_crop = None
                     output_frame = crop_frame(frame, crop, out_width, out_height)
                     scale_x = out_width / crop.w
                     scale_y = out_height / crop.h
                     offset_x = 0
                     offset_y = 0
-                if focus_box is not None:
-                    if output_box is not None:
-                        if use_blurred_fill:
-                            full_output_box = translate_box_to_crop(
-                                output_box,
-                                crop,
-                                full_scale_x,
-                                full_scale_y,
-                            )
-                            full_output_box = Box(
-                                x=full_output_box.x + full_offset_x,
-                                y=full_output_box.y + full_offset_y,
-                                w=full_output_box.w,
-                                h=full_output_box.h,
-                                label=full_output_box.label,
-                                conf=full_output_box.conf,
-                            )
-                            if layout_blend <= 0.001:
-                                output_box = full_output_box
-                            elif layout_blend >= 0.999:
-                                output_box = translate_box_with_scale(
-                                    output_box,
-                                    wide_scale_x,
-                                    wide_scale_y,
-                                    wide_offset_x,
-                                    wide_offset_y,
-                                )
-                            else:
-                                wide_output_box = translate_box_with_scale(
-                                    output_box,
-                                    wide_scale_x,
-                                    wide_scale_y,
-                                    wide_offset_x,
-                                    wide_offset_y,
-                                )
-                                output_box = blend_boxes(full_output_box, wide_output_box, layout_blend)
-                        else:
+                    if focus_box is not None:
+                        if output_box is not None:
                             output_box = translate_box_to_crop(output_box, crop, scale_x, scale_y)
                             output_box = Box(
                                 x=output_box.x + offset_x,
@@ -2275,15 +2848,12 @@ def annotate_video(
                             )
             elif prev_box is not None:
                 prev_center_x = prev_box.center()[0]
-                layout_blend = 0.0
 
             if draw_subject_box and output_box is not None and not (crop_active and source_inset):
                 draw_box(output_frame, output_box, subject_name)
 
             if source_inset and crop_active:
                 inset_crop = crop
-                if use_blurred_fill and layout_blend >= 0.5:
-                    inset_crop = None
                 render_source_inset(output_frame, frame, display_box, inset_crop)
 
             writer.write(output_frame)
@@ -2291,7 +2861,7 @@ def annotate_video(
             if frame_count > 0 and (
                 frame_idx == 0
                 or frame_idx + 1 >= frame_count
-                or now - last_render_emit_at >= 0.20
+                or now - last_render_emit_at >= 0.50
             ):
                 ratio = (frame_idx + 1) / max(frame_count, 1)
                 elapsed = now - render_started_at
@@ -2300,7 +2870,7 @@ def annotate_video(
                     "rendering",
                     current=frame_idx + 1,
                     total=frame_count,
-                    message="Rendering 9:16 video frames.",
+                    message="Rendering split 9:16 layout." if layout_mode == "split" else "Rendering 9:16 crop.",
                     eta_seconds=eta_seconds,
                 )
                 last_render_emit_at = now
@@ -2308,20 +2878,31 @@ def annotate_video(
         cap.release()
         writer.release()
 
-    emit_progress("muxing", current=0, total=1, message="Muxing audio and finalizing file.")
-    mux_audio(temp_video, input_path, output_path)
-    emit_progress("muxing", current=1, total=1, message="Audio muxing complete.", eta_seconds=0.0)
+    try:
+        emit_progress("muxing", current=0, total=1, message="Muxing audio and finalizing file.")
+        mux_audio(temp_video, input_path, output_path, duration_limit_sec=duration_limit_sec)
+        emit_progress("muxing", current=1, total=1, message="Audio muxing complete.", eta_seconds=0.0)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def mux_audio(video_path: str, source_path: str, output_path: str):
-    cmd = [
+def mux_audio(video_path: str, source_path: str, output_path: str, duration_limit_sec: Optional[float] = None):
+    copy_cmd = [
         FFMPEG_BIN,
         "-y",
         "-hide_banner",
         "-loglevel",
         "error",
+    ]
+    if duration_limit_sec is not None and duration_limit_sec > 0:
+        copy_cmd.extend(["-t", str(duration_limit_sec)])
+    copy_cmd.extend([
         "-i",
         video_path,
+    ])
+    if duration_limit_sec is not None and duration_limit_sec > 0:
+        copy_cmd.extend(["-t", str(duration_limit_sec)])
+    copy_cmd.extend([
         "-i",
         source_path,
         "-map",
@@ -2329,29 +2910,55 @@ def mux_audio(video_path: str, source_path: str, output_path: str):
         "-map",
         "1:a?",
         "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "21",
-        "-pix_fmt",
-        "yuv420p",
+        "copy",
         "-movflags",
         "+faststart",
-        "-profile:v",
-        "high",
-        "-level:v",
-        "4.0",
         "-c:a",
         "aac",
-        "-b:a",
-        "128k",
-        "-ar",
-        "48000",
         "-shortest",
         output_path,
-    ]
-    subprocess.run(cmd, check=True)
+    ])
+    try:
+        subprocess.run(copy_cmd, check=True)
+    except subprocess.CalledProcessError:
+        reencode_cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ]
+        if duration_limit_sec is not None and duration_limit_sec > 0:
+            reencode_cmd.extend(["-t", str(duration_limit_sec)])
+        reencode_cmd.extend([
+            "-i",
+            video_path,
+        ])
+        if duration_limit_sec is not None and duration_limit_sec > 0:
+            reencode_cmd.extend(["-t", str(duration_limit_sec)])
+        reencode_cmd.extend([
+            "-i",
+            source_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "24",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-shortest",
+            output_path,
+        ])
+        subprocess.run(reencode_cmd, check=True)
 
 
 def main():
@@ -2364,11 +2971,10 @@ def main():
     parser.add_argument("--aspect-ratio")
     parser.add_argument("--no-box", action="store_true")
     parser.add_argument("--source-inset", action="store_true")
-    parser.add_argument("--llama-url")
-    parser.add_argument("--focus-plan-interval", type=float)
-    parser.add_argument("--focus-plan-batch-size", type=int)
-    parser.add_argument("--scene-change-threshold", type=float)
-    parser.add_argument("--scene-change-min-gap-sec", type=float)
+    parser.add_argument("--detect-every-n", type=int, default=DEFAULT_DETECT_EVERY_N)
+    parser.add_argument("--face-detect-every-n", type=int, default=DEFAULT_FACE_DETECT_EVERY_N)
+    parser.add_argument("--duration-limit", type=float)
+    parser.add_argument("--layout-mode", default="fill")
     args = parser.parse_args()
 
     target_aspect = None
@@ -2376,18 +2982,6 @@ def main():
         target_aspect = parse_aspect_ratio(args.aspect_ratio)
     elif args.crop_vertical:
         target_aspect = 9.0 / 16.0
-
-    focus_plan = build_focus_plan(
-        args.input,
-        args.model,
-        args.subject.lower().strip(),
-        args.llama_url or os.environ.get("LLAMA_BASE_URL"),
-        target_aspect=target_aspect,
-        sample_interval_sec=args.focus_plan_interval,
-        batch_size=args.focus_plan_batch_size,
-        scene_change_threshold=args.scene_change_threshold,
-        scene_change_min_gap_sec=args.scene_change_min_gap_sec,
-    )
 
     annotate_video(
         args.input,
@@ -2397,7 +2991,10 @@ def main():
         target_aspect=target_aspect,
         draw_subject_box=not args.no_box,
         source_inset=args.source_inset,
-        focus_plan=focus_plan,
+        detect_every_n=args.detect_every_n,
+        face_detect_every_n=args.face_detect_every_n,
+        duration_limit_sec=args.duration_limit,
+        layout_mode=(args.layout_mode or "fill").strip().lower(),
     )
     emit_progress("complete", current=1, total=1, message="Focus cut complete.", eta_seconds=0.0)
     print(args.output)

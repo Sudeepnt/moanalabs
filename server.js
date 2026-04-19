@@ -19,11 +19,16 @@ const MAX_CTX_SIZE = Number(process.env.MAX_CTX_SIZE || 65536);
 const GPU_LAYERS = process.env.GPU_LAYERS || "999";
 const LLAMA_BASE_URL = `http://${LLAMA_HOST}:${LLAMA_PORT}`;
 const MAX_VIDEO_FRAMES = Number(process.env.MAX_VIDEO_FRAMES || 6);
+const FOCUS_DETECT_EVERY_N = Math.max(1, Number(process.env.FOCUS_DETECT_EVERY_N || 1));
+const FOCUS_FACE_DETECT_EVERY_N = Math.max(1, Number(process.env.FOCUS_FACE_DETECT_EVERY_N || 1));
 const MAX_UPLOAD_MB = Math.max(1, Number(process.env.MAX_UPLOAD_MB || 1024));
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const DETECTOR_MODEL_PATH =
   process.env.DETECTOR_MODEL_PATH || path.join(__dirname, "models", "efficientdet_lite0.tflite");
 const GENERATED_DIR = path.join(__dirname, "generated");
+const DEFAULT_FOCUS_CUT_SOURCE_PATH =
+  process.env.DEFAULT_FOCUS_CUT_SOURCE_PATH ||
+  "/Users/sudeepnt/Desktop/New Folder With Items 2/The_Future_Mark_Zuckerberg_first2m_source.mp4";
 function resolveFirstExistingPath(candidates) {
   for (const candidate of candidates) {
     if (candidate && fs.existsSync(candidate)) {
@@ -130,6 +135,7 @@ app.post("/api/explain", upload.single("media"), async (req, res) => {
     }
 
     const requestedModelId = resolveRequestedModelId(req.body?.modelId);
+    const maxDurationSec = parseRequestedDurationSec(req.body?.maxDurationSec);
     await ensureLlamaServer(requestedModelId);
 
     if (isVideoMimeType(req.file.mimetype, req.file.originalname)) {
@@ -137,13 +143,19 @@ app.post("/api/explain", upload.single("media"), async (req, res) => {
         (req.body.prompt || "").trim() ||
         "These are sampled frames from one video in chronological order. Explain what happens across the video, mention the key objects or people, and include any readable on-screen text.";
 
-      const { analyses, frameCount, subjectHint } = await analyzeVideo(req.file, prompt, requestedModelId);
+      const { analyses, frameCount, subjectHint, usedDurationSec } = await analyzeVideo(
+        req.file,
+        prompt,
+        requestedModelId,
+        maxDurationSec,
+      );
       return res.json({
         answer: formatCombinedAnswer(analyses),
         analyses,
         meta: {
           type: "video",
           frameCount,
+          usedDurationSec,
           subjectHint,
           activeModelId: requestedModelId,
           activeModelName: getModelConfig(requestedModelId).name,
@@ -197,28 +209,37 @@ app.post("/api/explain", upload.single("media"), async (req, res) => {
 });
 
 app.post("/api/focus-cut", upload.single("media"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "Please upload a video first." });
+  const inputFile = req.file ? normalizeUploadedVideo(req.file) : await loadDefaultFocusCutSource();
+
+  if (!inputFile) {
+    return res.status(400).json({
+      error: `Please upload a video first, or make sure the default focus-cut source exists at ${DEFAULT_FOCUS_CUT_SOURCE_PATH}.`,
+    });
   }
 
-  if (!isVideoMimeType(req.file.mimetype, req.file.originalname)) {
+  if (!isVideoMimeType(inputFile.mimetype, inputFile.originalname)) {
     return res.status(400).json({
       error: "Focus and Cut works on video uploads only.",
     });
   }
 
   const job = createFocusCutJob({
-    originalName: req.file.originalname || "video.mp4",
+    originalName: inputFile.originalname || "video.mp4",
   });
   const initialSubjectHint = normalizeSubjectHint((req.body.subjectHint || "").trim());
   const requestedModelId = resolveRequestedModelId(req.body.modelId);
-  const filePayload = {
-    buffer: Buffer.from(req.file.buffer),
-    originalname: req.file.originalname || "video.mp4",
-    mimetype: req.file.mimetype || "video/mp4",
-  };
+  const maxDurationSec = parseRequestedDurationSec(req.body?.maxDurationSec);
+  const layoutMode = normalizeLayoutMode(req.body?.layoutMode);
+  const filePayload = inputFile;
 
-  processFocusCutJob(job.id, filePayload, initialSubjectHint, requestedModelId).catch((error) => {
+  processFocusCutJob(
+    job.id,
+    filePayload,
+    initialSubjectHint,
+    requestedModelId,
+    maxDurationSec,
+    layoutMode,
+  ).catch((error) => {
     failFocusCutJob(job.id, error);
   });
 
@@ -337,6 +358,41 @@ function resolveRequestedModelId(rawModelId) {
     return candidate;
   }
   return activeModelId || DEFAULT_MODEL_ID;
+}
+
+function parseRequestedDurationSec(rawValue) {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function normalizeLayoutMode(rawValue) {
+  const normalized = String(rawValue || "")
+    .trim()
+    .toLowerCase();
+  return normalized === "split" ? "split" : "split";
+}
+
+function normalizeUploadedVideo(file) {
+  return {
+    buffer: Buffer.from(file.buffer),
+    originalname: file.originalname || "video.mp4",
+    mimetype: file.mimetype || "video/mp4",
+  };
+}
+
+async function loadDefaultFocusCutSource() {
+  if (!DEFAULT_FOCUS_CUT_SOURCE_PATH || !fs.existsSync(DEFAULT_FOCUS_CUT_SOURCE_PATH)) {
+    return null;
+  }
+
+  return {
+    buffer: await fsp.readFile(DEFAULT_FOCUS_CUT_SOURCE_PATH),
+    originalname: path.basename(DEFAULT_FOCUS_CUT_SOURCE_PATH),
+    mimetype: "video/mp4",
+  };
 }
 
 async function ensureLlamaServer(modelId = DEFAULT_MODEL_ID) {
@@ -671,14 +727,18 @@ async function stopLlamaServer() {
   });
 }
 
-async function analyzeVideo(file, prompt, modelId) {
+async function analyzeVideo(file, prompt, modelId, maxDurationSec = null) {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "qwen-vl-video-"));
 
   try {
     const inputPath = path.join(tempDir, safeFileName(file.originalname || "upload-video"));
     await fsp.writeFile(inputPath, file.buffer);
 
-    const { framePaths, contentParts } = await buildVideoContentParts(inputPath, tempDir);
+    const { framePaths, contentParts, usedDurationSec } = await buildVideoContentParts(
+      inputPath,
+      tempDir,
+      maxDurationSec,
+    );
 
     const orderedPrompt =
       `${prompt}\n\n` +
@@ -695,6 +755,7 @@ async function analyzeVideo(file, prompt, modelId) {
     return {
       analyses,
       frameCount: framePaths.length,
+      usedDurationSec,
       subjectHint: choosePreferredSubjectHint(analyses),
     };
   } finally {
@@ -702,8 +763,12 @@ async function analyzeVideo(file, prompt, modelId) {
   }
 }
 
-async function buildVideoContentParts(inputPath, tempDir) {
-  const duration = await getVideoDuration(inputPath);
+async function buildVideoContentParts(inputPath, tempDir, maxDurationSec = null) {
+  const sourceDuration = await getVideoDuration(inputPath);
+  const duration =
+    Number.isFinite(maxDurationSec) && maxDurationSec > 0
+      ? Math.min(sourceDuration, maxDurationSec)
+      : sourceDuration;
   const framePaths = await extractVideoFrames(inputPath, tempDir, duration);
 
   if (framePaths.length === 0) {
@@ -728,6 +793,7 @@ async function buildVideoContentParts(inputPath, tempDir) {
   return {
     framePaths,
     contentParts,
+    usedDurationSec: duration,
   };
 }
 
@@ -760,6 +826,8 @@ async function extractVideoFrames(inputPath, tempDir, duration) {
     "error",
     "-i",
     inputPath,
+    "-t",
+    String(duration),
     "-vf",
     `fps=1/${intervalSeconds}`,
     "-frames:v",
@@ -984,7 +1052,7 @@ function applyPythonProgressToJob(jobId, payload) {
   });
 }
 
-async function processFocusCutJob(jobId, file, initialSubjectHint, modelId) {
+async function processFocusCutJob(jobId, file, initialSubjectHint, modelId, maxDurationSec, layoutMode) {
   const job = focusCutJobs.get(jobId);
   if (!job) {
     return;
@@ -1022,7 +1090,7 @@ async function processFocusCutJob(jobId, file, initialSubjectHint, modelId) {
         message: "Detecting the main subject.",
         progress: Math.round(stageProgressToOverall("subject", 0.2) * 100),
       });
-      const { framePaths, contentParts } = await buildVideoContentParts(inputPath, tempDir);
+      const { framePaths, contentParts } = await buildVideoContentParts(inputPath, tempDir, maxDurationSec);
       frameCount = framePaths.length;
       subjectHint = await inferMainSubject(
         contentParts,
@@ -1043,9 +1111,12 @@ async function processFocusCutJob(jobId, file, initialSubjectHint, modelId) {
     const outputPath = path.join(GENERATED_DIR, outputName);
 
     updateFocusCutJob(jobId, {
-      stage: "planning",
-      message: "Planning BIG/MID layout.",
-      progress: Math.round(stageProgressToOverall("planning", 0.0) * 100),
+      stage: "rendering",
+      message:
+        layoutMode === "split"
+          ? "Rendering split 9:16 layout."
+          : "Tracking subject and rendering 9:16 crop.",
+      progress: Math.round(stageProgressToOverall("rendering", 0.05) * 100),
       outputName,
       outputUrl: `/generated/${outputName}`,
       downloadName: outputName,
@@ -1053,7 +1124,7 @@ async function processFocusCutJob(jobId, file, initialSubjectHint, modelId) {
       subjectHint,
     });
 
-    await renderFocusCutVideo(inputPath, outputPath, renderSubject, (payload) => {
+    await renderFocusCutVideo(inputPath, outputPath, renderSubject, maxDurationSec, layoutMode, (payload) => {
       applyPythonProgressToJob(jobId, payload);
     });
 
@@ -1095,7 +1166,7 @@ function isVideoMimeType(mimeType, fileName = "") {
   return mimeType.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi)$/i.test(fileName);
 }
 
-async function renderFocusCutVideo(inputPath, outputPath, subjectHint, onProgress) {
+async function renderFocusCutVideo(inputPath, outputPath, subjectHint, maxDurationSec, layoutMode, onProgress) {
   if (!fs.existsSync(DETECTOR_MODEL_PATH)) {
     throw new Error(`MediaPipe detector model not found at ${DETECTOR_MODEL_PATH}`);
   }
@@ -1110,11 +1181,18 @@ async function renderFocusCutVideo(inputPath, outputPath, subjectHint, onProgres
     DETECTOR_MODEL_PATH,
     "--subject",
     subjectHint,
-    "--llama-url",
-    LLAMA_BASE_URL,
     "--crop-vertical",
     "--no-box",
+    "--detect-every-n",
+    String(FOCUS_DETECT_EVERY_N),
+    "--face-detect-every-n",
+    String(FOCUS_FACE_DETECT_EVERY_N),
+    "--layout-mode",
+    normalizeLayoutMode(layoutMode),
   ];
+  if (Number.isFinite(maxDurationSec) && maxDurationSec > 0) {
+    args.push("--duration-limit", String(maxDurationSec));
+  }
   await runCommandWithProgress(PYTHON_BIN, args, onProgress);
 }
 

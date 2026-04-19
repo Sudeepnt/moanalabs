@@ -5,9 +5,15 @@ const fileName = document.getElementById("file-name");
 const uploadSubtitle = document.getElementById("upload-subtitle");
 const promptInput = document.getElementById("prompt");
 const modelSelect = document.getElementById("model-select");
+const layoutPicker = document.getElementById("layout-picker");
+const layoutDescription = document.getElementById("layout-description");
 const previewWrap = document.getElementById("preview-wrap");
 const previewImage = document.getElementById("preview-image");
 const previewVideo = document.getElementById("preview-video");
+const videoDurationWrap = document.getElementById("video-duration-wrap");
+const videoDurationLabel = document.getElementById("video-duration-label");
+const videoDurationSlider = document.getElementById("video-duration-slider");
+const videoDurationValue = document.getElementById("video-duration-value");
 const overlayCanvas = document.getElementById("overlay-canvas");
 const overlayContext = overlayCanvas.getContext("2d");
 const subjectBoxStatus = document.getElementById("subject-box-status");
@@ -16,16 +22,22 @@ const explainButton = document.getElementById("submit-button");
 const focusCutButton = document.getElementById("focus-cut-button");
 const statusPill = document.getElementById("status-pill");
 const generatedLink = document.getElementById("generated-link");
+const outputVideoWrap = document.getElementById("output-video-wrap");
+const outputVideo = document.getElementById("output-video");
 const focusProgress = document.getElementById("focus-progress");
 const focusProgressStage = document.getElementById("focus-progress-stage");
 const focusProgressPercent = document.getElementById("focus-progress-percent");
 const focusProgressFill = document.getElementById("focus-progress-fill");
 const focusProgressEta = document.getElementById("focus-progress-eta");
 const focusProgressDetail = document.getElementById("focus-progress-detail");
+const resultMeta = document.getElementById("result-meta");
 
 const EXPLAIN_BUTTON_TEXT = "Explain Media";
 const FOCUS_CUT_BUTTON_TEXT = "Focus and Cut";
 const FOCUS_POLL_INTERVAL_MS = 900;
+const DEFAULT_LAYOUT_MODE = "split";
+const DEFAULT_FOCUS_CUT_SOURCE_LABEL =
+  "The_Future_Mark_Zuckerberg_first2m_source.mp4";
 
 let selectedFile = null;
 let previewUrl = null;
@@ -38,6 +50,19 @@ let lastVideoTime = -1;
 let mediaPipeUnavailable = false;
 let activeModelId = "";
 let modelSwitchInFlight = false;
+let activeRequestStartedAt = 0;
+let lastElapsedLabel = "";
+let selectedProcessDurationSec = 0;
+let inputVideoDurationSec = 0;
+let selectedLayoutMode = DEFAULT_LAYOUT_MODE;
+
+const LAYOUT_DESCRIPTIONS = {
+  fill: "Fill: crop to cover the full 9:16 frame while keeping the main subject in view.",
+  fit: "Fit: keep the full source frame visible inside 9:16 and use background treatment around it.",
+  three: "Three: use a 3-panel composition for multi-person or multi-source clips with one clear primary panel.",
+  four: "Four: use a 2x2 grid so each person or source keeps a visible region in frame.",
+  split: "Split: divide the frame into two readable sections for speaker plus demo, gameplay, or comparison content.",
+};
 
 input.addEventListener("change", () => {
   const file = input.files?.[0];
@@ -59,13 +84,22 @@ modelSelect.addEventListener("change", async () => {
   await activateSelectedModel();
 });
 
-focusCutButton.addEventListener("click", async () => {
-  if (!selectedFile) {
-    result.textContent = "Please choose a video first.";
+layoutPicker.addEventListener("click", (event) => {
+  const button = event.target.closest(".layout-option");
+  if (!button) {
     return;
   }
 
-  if (!isVideoFile(selectedFile)) {
+  setSelectedLayoutMode(button.dataset.layout || DEFAULT_LAYOUT_MODE);
+});
+
+videoDurationSlider.addEventListener("input", () => {
+  selectedProcessDurationSec = Number(videoDurationSlider.value || 0);
+  renderVideoDurationUi();
+});
+
+focusCutButton.addEventListener("click", async () => {
+  if (selectedFile && !isVideoFile(selectedFile)) {
     result.textContent = "Focus and Cut works on video uploads only.";
     return;
   }
@@ -175,10 +209,17 @@ async function runExplainRequest() {
   if (activeModelId) {
     formData.append("modelId", activeModelId);
   }
+  formData.append("layoutMode", selectedLayoutMode);
+  if (isVideoFile(selectedFile) && selectedProcessDurationSec > 0) {
+    formData.append("maxDurationSec", String(selectedProcessDurationSec));
+  }
 
+  activeRequestStartedAt = performance.now();
   setActionState("explain", true);
   hideGeneratedLink();
+  hideOutputVideo();
   hideFocusProgress();
+  clearResultMeta();
   result.textContent = isVideoFile(selectedFile)
     ? `Uploading video, sampling frames, and running ${getActiveModelName()}...`
     : `Uploading image and running ${getActiveModelName()}...`;
@@ -194,12 +235,16 @@ async function runExplainRequest() {
       throw new Error(data.error || "Request failed.");
     }
 
-    result.textContent = formatExplainResult(data);
+    lastElapsedLabel = `Explain completed in ${formatElapsedMs(performance.now() - activeRequestStartedAt)}`;
+    result.textContent = `${lastElapsedLabel}\n\n${formatExplainResult(data)}`;
+    showElapsedTime("Explain completed in", performance.now() - activeRequestStartedAt);
     await annotateSubject(data?.meta?.subjectHint || "");
   } catch (error) {
     result.textContent = `Error: ${error.message}`;
+    clearResultMeta();
     setSubjectBoxStatus("Could not draw a subject box.", "warn");
   } finally {
+    activeRequestStartedAt = 0;
     setActionState("explain", false);
   }
 }
@@ -228,26 +273,40 @@ function formatExplainResult(data) {
 
 async function runFocusCutRequest() {
   const formData = new FormData();
-  formData.append("media", selectedFile);
+  if (selectedFile) {
+    formData.append("media", selectedFile);
+  }
   formData.append("subjectHint", currentSubjectHint);
   if (activeModelId) {
     formData.append("modelId", activeModelId);
   }
+  formData.append("layoutMode", selectedLayoutMode);
+  if (selectedProcessDurationSec > 0) {
+    formData.append("maxDurationSec", String(selectedProcessDurationSec));
+  }
 
+  activeRequestStartedAt = performance.now();
   setActionState("focus-cut", true);
   hideGeneratedLink();
+  hideOutputVideo();
   clearOverlay();
   showFocusProgress();
+  clearResultMeta();
   updateFocusProgressUi({
     stage: "upload",
-    message: "Uploading video and creating render job.",
+    message: selectedFile
+      ? "Uploading video and creating render job."
+      : `Using default source video (${DEFAULT_FOCUS_CUT_SOURCE_LABEL}) and creating render job.`,
     progress: 1,
     etaSeconds: null,
   });
   result.textContent = currentSubjectHint
-    ? `Creating a 9:16 crop that follows "${currentSubjectHint}"...`
-    : "Finding the main subject and creating a 9:16 vertical crop...";
-  setSubjectBoxStatus("Building BIG/MID focus plan and rendering output...", "");
+    ? `Creating a split 9:16 output that follows "${currentSubjectHint}"${selectedFile ? "" : ` from ${DEFAULT_FOCUS_CUT_SOURCE_LABEL}`}...`
+    : `Finding the main subject and creating a split 9:16 output${selectedFile ? "" : ` from ${DEFAULT_FOCUS_CUT_SOURCE_LABEL}`}...`;
+  setSubjectBoxStatus(
+    "Tracking subject and rendering split 9:16 output...",
+    "",
+  );
 
   try {
     const response = await fetch("/api/focus-cut", {
@@ -263,17 +322,24 @@ async function runFocusCutRequest() {
     const data = await waitForFocusCutJob(startData.jobId);
     currentSubjectHint = data.subjectHint || currentSubjectHint;
     showGeneratedLink(data.outputUrl, data.downloadName);
+    showOutputVideo(data.outputUrl);
     previewRenderedVideo(data.outputUrl);
     updateFocusProgressUi({
       stage: "complete",
-      message: "Focus cut complete.",
+      message: `Focus cut complete in ${formatElapsedMs(performance.now() - activeRequestStartedAt)}.`,
       progress: 100,
       etaSeconds: 0,
     });
+    lastElapsedLabel = `Focus cut completed in ${formatElapsedMs(performance.now() - activeRequestStartedAt)}`;
+    showElapsedTime("Focus cut completed in", performance.now() - activeRequestStartedAt);
     result.textContent =
+      `${lastElapsedLabel}\n\n` +
       `[Focus and cut ready]\n\n` +
       `Subject: ${data.subjectHint || data.renderSubject}\n` +
-      "Output: 9:16 vertical crop centered on the main subject.";
+      `Layout: ${selectedLayoutMode}\n` +
+      (selectedLayoutMode === "split"
+        ? "Output: split 9:16 layout with subject focus and full-frame context."
+        : "Output: 9:16 vertical crop centered on the main subject.");
     setSubjectBoxStatus(
       `Focused 9:16 video ready${data.subjectHint ? ` for "${data.subjectHint}"` : ""}.`,
       "ready",
@@ -281,8 +347,10 @@ async function runFocusCutRequest() {
   } catch (error) {
     hideFocusProgress();
     result.textContent = `Error: ${error.message}`;
+    clearResultMeta();
     setSubjectBoxStatus("Could not create the focused 9:16 crop.", "warn");
   } finally {
+    activeRequestStartedAt = 0;
     setActionState("focus-cut", false);
   }
 }
@@ -386,10 +454,14 @@ function delay(ms) {
 function setSelectedFile(file) {
   selectedFile = file;
   currentSubjectHint = "";
+  inputVideoDurationSec = 0;
+  selectedProcessDurationSec = 0;
   stopVideoDetection();
   hideGeneratedLink();
+  hideOutputVideo();
   hideFocusProgress();
   clearOverlay();
+  hideVideoDurationControls();
 
   if (previewUrl) {
     URL.revokeObjectURL(previewUrl);
@@ -422,6 +494,11 @@ function setSelectedFile(file) {
     previewImage.removeAttribute("src");
     previewImage.classList.add("hidden");
     previewVideo.load();
+    previewVideo.onloadedmetadata = () => {
+      inputVideoDurationSec = Number(previewVideo.duration || 0);
+      selectedProcessDurationSec = Math.max(1, Math.floor(inputVideoDurationSec || 0));
+      configureVideoDurationControls();
+    };
     previewVideo.onloadeddata = () => {
       syncOverlaySize(previewVideo);
     };
@@ -446,6 +523,58 @@ function syncInputFiles(file) {
   } catch {
     // Some browsers may block programmatic file assignment; selectedFile is still used for upload.
   }
+}
+
+function setSelectedLayoutMode(layoutMode) {
+  const nextMode = DEFAULT_LAYOUT_MODE;
+  selectedLayoutMode = nextMode;
+
+  for (const option of layoutPicker.querySelectorAll(".layout-option")) {
+    const isActive = option.dataset.layout === nextMode;
+    option.classList.toggle("active", isActive);
+    option.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+
+  layoutDescription.textContent = LAYOUT_DESCRIPTIONS[nextMode];
+}
+
+setSelectedLayoutMode(DEFAULT_LAYOUT_MODE);
+
+function configureVideoDurationControls() {
+  if (!inputVideoDurationSec || !Number.isFinite(inputVideoDurationSec)) {
+    hideVideoDurationControls();
+    return;
+  }
+
+  const maxSeconds = Math.max(1, Math.floor(inputVideoDurationSec));
+  videoDurationSlider.min = "1";
+  videoDurationSlider.max = String(maxSeconds);
+  videoDurationSlider.step = "1";
+  videoDurationSlider.value = String(
+    Math.min(maxSeconds, Math.max(1, Math.round(selectedProcessDurationSec || maxSeconds))),
+  );
+  selectedProcessDurationSec = Number(videoDurationSlider.value);
+  videoDurationWrap.classList.remove("hidden");
+  renderVideoDurationUi();
+}
+
+function hideVideoDurationControls() {
+  videoDurationWrap.classList.add("hidden");
+  videoDurationValue.textContent = "";
+  videoDurationLabel.textContent = "Process duration";
+}
+
+function renderVideoDurationUi() {
+  if (!inputVideoDurationSec || !Number.isFinite(inputVideoDurationSec)) {
+    hideVideoDurationControls();
+    return;
+  }
+
+  const totalSeconds = Math.max(1, Math.floor(inputVideoDurationSec));
+  const chosenSeconds = Math.max(1, Math.min(totalSeconds, Math.round(selectedProcessDurationSec || totalSeconds)));
+  selectedProcessDurationSec = chosenSeconds;
+  videoDurationLabel.textContent = "Process first part of video";
+  videoDurationValue.textContent = `Processing first ${formatDuration(chosenSeconds)} of ${formatDuration(totalSeconds)}`;
 }
 
 function isSupportedFile(file) {
@@ -709,6 +838,61 @@ function hideGeneratedLink() {
   generatedLink.removeAttribute("href");
   generatedLink.removeAttribute("download");
   generatedLink.classList.add("hidden");
+}
+
+function showOutputVideo(url) {
+  if (!outputVideoWrap || !outputVideo) {
+    return;
+  }
+
+  const resolvedUrl = `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+  outputVideo.pause();
+  outputVideo.src = resolvedUrl;
+  outputVideoWrap.classList.remove("hidden");
+  outputVideo.load();
+}
+
+function hideOutputVideo() {
+  if (!outputVideoWrap || !outputVideo) {
+    return;
+  }
+
+  outputVideo.pause();
+  outputVideo.removeAttribute("src");
+  outputVideo.load();
+  outputVideoWrap.classList.add("hidden");
+}
+
+function showElapsedTime(prefix, elapsedMs) {
+  if (!resultMeta) {
+    return;
+  }
+  resultMeta.textContent = `${prefix} ${formatElapsedMs(elapsedMs)}`;
+  resultMeta.classList.remove("hidden");
+}
+
+function clearResultMeta() {
+  if (!resultMeta) {
+    return;
+  }
+  resultMeta.textContent = "";
+  resultMeta.classList.add("hidden");
+}
+
+function formatElapsedMs(elapsedMs) {
+  const totalMs = Math.max(0, Math.round(Number(elapsedMs) || 0));
+  if (totalMs < 1000) {
+    return `${totalMs} ms`;
+  }
+
+  const totalSeconds = totalMs / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(2)} s`;
+  }
+
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds - mins * 60;
+  return `${mins}m ${secs.toFixed(1)}s`;
 }
 
 function previewRenderedVideo(url) {
